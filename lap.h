@@ -1,10 +1,17 @@
+#pragma once
+
 #include <cassert>
 #include <cstdio>
 #include <limits>
 #include <memory>
 
-#include <immintrin.h>
-
+#ifdef __aarch64__
+  // For ARM64, use ARM-specific NEON headers
+  #include <arm_neon.h>
+#else
+  // x86 specific headers
+  #include <immintrin.h>
+#endif
 
 #ifdef __GNUC__
 #define always_inline __attribute__((always_inline)) inline
@@ -49,47 +56,54 @@ find_umins_regular(
 #define FLOAT_MIN_DIM 64
 #define DOUBLE_MIN_DIM 100000  // 64-bit code is actually always slower
 
+// Add NEON optimized version
 template <typename idx>
 always_inline std::tuple<float, float, idx, idx>
-find_umins_avx2(
+find_umins_neon(
     idx dim, idx i, const float *restrict assign_cost,
     const float *restrict v) {
   if (dim < FLOAT_MIN_DIM) {
     return find_umins_regular(dim, i, assign_cost, v);
   }
   const float *local_cost = assign_cost + i * dim;
-  __m256i idxvec = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-  __m256i j1vec = _mm256_set1_epi32(-1), j2vec = _mm256_set1_epi32(-1);
-  __m256 uminvec = _mm256_set1_ps(std::numeric_limits<float>::max()),
-         usubminvec = _mm256_set1_ps(std::numeric_limits<float>::max());
-  for (idx j = 0; j < dim - 7; j += 8) {
-    __m256 acvec = _mm256_loadu_ps(local_cost + j);
-    __m256 vvec = _mm256_loadu_ps(v + j);
-    __m256 h = _mm256_sub_ps(acvec, vvec);
-    __m256 cmp = _mm256_cmp_ps(h, uminvec, _CMP_LE_OQ);
-    usubminvec = _mm256_blendv_ps(usubminvec, uminvec, cmp);
-    j2vec = _mm256_blendv_epi8(
-        j2vec, j1vec, _mm256_castps_si256(cmp));
-    uminvec = _mm256_blendv_ps(uminvec, h, cmp);
-    j1vec = _mm256_blendv_epi8(
-        j1vec, idxvec, _mm256_castps_si256(cmp));
-    cmp = _mm256_andnot_ps(cmp, _mm256_cmp_ps(h, usubminvec, _CMP_LT_OQ));
-    usubminvec = _mm256_blendv_ps(usubminvec, h, cmp);
-    j2vec = _mm256_blendv_epi8(
-        j2vec, idxvec, _mm256_castps_si256(cmp));
-    idxvec = _mm256_add_epi32(idxvec, _mm256_set1_epi32(8));
+  
+  float32x4_t uminvec = vdupq_n_f32(std::numeric_limits<float>::max());
+  float32x4_t usubminvec = vdupq_n_f32(std::numeric_limits<float>::max());
+  int32x4_t j1vec = vdupq_n_s32(-1);
+  int32x4_t j2vec = vdupq_n_s32(-1);
+  int32x4_t idxvec = {0, 1, 2, 3};
+  
+  for (idx j = 0; j < dim - 3; j += 4) {
+    float32x4_t acvec = vld1q_f32(local_cost + j);
+    float32x4_t vvec = vld1q_f32(v + j);
+    float32x4_t h = vsubq_f32(acvec, vvec);
+    
+    uint32x4_t cmp = vcleq_f32(h, uminvec);
+    usubminvec = vbslq_f32(cmp, uminvec, usubminvec);
+    j2vec = vbslq_s32(cmp, j1vec, j2vec);
+    uminvec = vbslq_f32(cmp, h, uminvec);
+    j1vec = vbslq_s32(cmp, idxvec, j1vec);
+    
+    cmp = vandq_u32(vmvnq_u32(cmp), vcltq_f32(h, usubminvec));
+    usubminvec = vbslq_f32(cmp, h, usubminvec);
+    j2vec = vbslq_s32(cmp, idxvec, j2vec);
+    
+    idxvec = vaddq_s32(idxvec, vdupq_n_s32(4));
   }
-  alignas(__m256) float uminmem[8], usubminmem[8];
-  alignas(__m256) int32_t j1mem[8], j2mem[8];
-  _mm256_store_ps(uminmem, uminvec);
-  _mm256_store_ps(usubminmem, usubminvec);
-  _mm256_store_si256(reinterpret_cast<__m256i*>(j1mem), j1vec);
-  _mm256_store_si256(reinterpret_cast<__m256i*>(j2mem), j2vec);
+
+  // Process remaining elements
+  float uminmem[4], usubminmem[4];
+  int32_t j1mem[4], j2mem[4];
+  
+  vst1q_f32(uminmem, uminvec);
+  vst1q_f32(usubminmem, usubminvec);
+  vst1q_s32(j1mem, j1vec);
+  vst1q_s32(j2mem, j2vec);
 
   idx j1 = -1, j2 = -1;
   float umin = std::numeric_limits<float>::max(),
         usubmin = std::numeric_limits<float>::max();
-  for (int vi = 0; vi < 8; vi++) {
+  for (int vi = 0; vi < 4; vi++) {
     float h = uminmem[vi];
     if (h < usubmin) {
       idx jnew = j1mem[vi];
@@ -104,7 +118,7 @@ find_umins_avx2(
       }
     }
   }
-  for (int vi = 0; vi < 8; vi++) {
+  for (int vi = 0; vi < 4; vi++) {
     float h = usubminmem[vi];
     if (h < usubmin) {
       usubmin = h;
@@ -133,6 +147,10 @@ always_inline std::tuple<double, double, idx, idx>
 find_umins_avx2(
     idx dim, idx i, const double *restrict assign_cost,
     const double *restrict v) {
+#ifdef __aarch64__
+  // On ARM64, fall back to regular implementation
+  return find_umins_regular(dim, i, assign_cost, v);
+#else
   if (dim < DOUBLE_MIN_DIM) {
     return find_umins_regular(dim, i, assign_cost, v);
   }
@@ -205,18 +223,31 @@ find_umins_avx2(
     }
   }
   return std::make_tuple(umin, usubmin, j1, j2);
+#endif
 }
 
-template <bool avx2, typename idx, typename cost>
+// Update find_umins to use NEON when available
+template <bool simd, typename idx, typename cost>
 always_inline std::tuple<cost, cost, idx, idx>
 find_umins(
     idx dim, idx i, const cost *restrict assign_cost,
     const cost *restrict v) {
-  if constexpr(avx2) {
-    return find_umins_avx2(dim, i, assign_cost, v);
-  } else {
-    return find_umins_regular(dim, i, assign_cost, v);
+  if constexpr(simd) {
+    if constexpr(std::is_same_v<cost, float>) {
+      #ifdef __aarch64__
+        return find_umins_neon(dim, i, assign_cost, v);
+      #else
+        return find_umins_regular(dim, i, assign_cost, v);
+      #endif
+    } else if constexpr(std::is_same_v<cost, double>) {
+      #ifdef __aarch64__
+        return find_umins_regular(dim, i, assign_cost, v);
+      #else
+        return find_umins_avx2(dim, i, assign_cost, v);
+      #endif
+    }
   }
+  return find_umins_regular(dim, i, assign_cost, v);
 }
 
 /// @brief Exact Jonker-Volgenant algorithm.

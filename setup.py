@@ -17,8 +17,16 @@ UNIX_CXXFLAGS = [
     "--param", "l2-cache-size=33792",
 ]
 
+# Update build flags for M1
+DARWIN_CXXFLAGS = [
+    "-std=c++17",
+    "-arch", "arm64",  # M1 support
+    "-O3",
+    "-ffast-math",
+]
+
 CXX_ARGS = {
-    # "Darwin": [*UNIX_CXXFLAGS],  not supported anymore due to M1, PRs welcome
+    "Darwin": DARWIN_CXXFLAGS,
     "Linux": ["-fopenmp", *UNIX_CXXFLAGS, "-mabm"],
     "Windows": ["/openmp", "/std:c++latest", "/arch:AVX2"],
 }
