@@ -54,7 +54,11 @@ find_umins_regular(
 
 // These are not constexpr because of typename idx
 #define FLOAT_MIN_DIM 64
-#define DOUBLE_MIN_DIM 100000  // 64-bit code is actually always slower
+#ifdef __aarch64__
+  #define DOUBLE_MIN_DIM 32  // NEON double operations are efficient on M1
+#else
+  #define DOUBLE_MIN_DIM 100000  // 64-bit code is actually always slower
+#endif
 
 // Add NEON optimized version
 template <typename idx>
@@ -67,13 +71,38 @@ find_umins_neon(
   }
   const float *local_cost = assign_cost + i * dim;
   
+  // Use vld1q_f32_x4 for better vectorization when possible
   float32x4_t uminvec = vdupq_n_f32(std::numeric_limits<float>::max());
   float32x4_t usubminvec = vdupq_n_f32(std::numeric_limits<float>::max());
   int32x4_t j1vec = vdupq_n_s32(-1);
   int32x4_t j2vec = vdupq_n_s32(-1);
   int32x4_t idxvec = {0, 1, 2, 3};
   
-  for (idx j = 0; j < dim - 3; j += 4) {
+  // Process 16 elements at once when possible
+  for (idx j = 0; j < dim - 15; j += 16) {
+    float32x4x4_t acvec = vld1q_f32_x4(local_cost + j);
+    float32x4x4_t vvec = vld1q_f32_x4(v + j);
+    
+    // Process each quarter
+    for (int q = 0; q < 4; q++) {
+      float32x4_t h = vsubq_f32(acvec.val[q], vvec.val[q]);
+      
+      uint32x4_t cmp = vcleq_f32(h, uminvec);
+      usubminvec = vbslq_f32(cmp, uminvec, usubminvec);
+      j2vec = vbslq_s32(cmp, j1vec, j2vec);
+      uminvec = vbslq_f32(cmp, h, uminvec);
+      j1vec = vbslq_s32(cmp, idxvec, j1vec);
+      
+      cmp = vandq_u32(vmvnq_u32(cmp), vcltq_f32(h, usubminvec));
+      usubminvec = vbslq_f32(cmp, h, usubminvec);
+      j2vec = vbslq_s32(cmp, idxvec, j2vec);
+      
+      idxvec = vaddq_s32(idxvec, vdupq_n_s32(4));
+    }
+  }
+
+  // Process remaining vectors of 4
+  for (idx j = dim & ~15; j < dim - 3; j += 4) {
     float32x4_t acvec = vld1q_f32(local_cost + j);
     float32x4_t vvec = vld1q_f32(v + j);
     float32x4_t h = vsubq_f32(acvec, vvec);
@@ -91,9 +120,9 @@ find_umins_neon(
     idxvec = vaddq_s32(idxvec, vdupq_n_s32(4));
   }
 
-  // Process remaining elements
-  float uminmem[4], usubminmem[4];
-  int32_t j1mem[4], j2mem[4];
+  // Ensure proper alignment for storing results
+  alignas(16) float uminmem[4], usubminmem[4];
+  alignas(16) int32_t j1mem[4], j2mem[4];
   
   vst1q_f32(uminmem, uminvec);
   vst1q_f32(usubminmem, usubminvec);
@@ -127,6 +156,90 @@ find_umins_neon(
   }
   for (idx j = dim & 0xFFFFFFF8u; j < dim; j++) {
     float h = local_cost[j] - v[j];
+    if (h < usubmin) {
+      if (h >= umin) {
+        usubmin = h;
+        j2 = j;
+      } else {
+        usubmin = umin;
+        umin = h;
+        j2 = j1;
+        j1 = j;
+      }
+    }
+  }
+  return std::make_tuple(umin, usubmin, j1, j2);
+}
+
+template <typename idx>
+always_inline std::tuple<double, double, idx, idx>
+find_umins_neon_double(
+    idx dim, idx i, const double *restrict assign_cost,
+    const double *restrict v) {
+  if (dim < DOUBLE_MIN_DIM) {
+    return find_umins_regular(dim, i, assign_cost, v);
+  }
+  const double *local_cost = assign_cost + i * dim;
+  
+  float64x2_t uminvec = vdupq_n_f64(std::numeric_limits<double>::max());
+  float64x2_t usubminvec = vdupq_n_f64(std::numeric_limits<double>::max());
+  int64x2_t j1vec = vdupq_n_s64(-1);
+  int64x2_t j2vec = vdupq_n_s64(-1);
+  int64x2_t idxvec = {0, 1};
+  
+  for (idx j = 0; j < dim - 1; j += 2) {
+    float64x2_t acvec = vld1q_f64(local_cost + j);
+    float64x2_t vvec = vld1q_f64(v + j);
+    float64x2_t h = vsubq_f64(acvec, vvec);
+    
+    uint64x2_t cmp = vcleq_f64(h, uminvec);
+    usubminvec = vbslq_f64(cmp, uminvec, usubminvec);
+    j2vec = vbslq_s64(cmp, j1vec, j2vec);
+    uminvec = vbslq_f64(cmp, h, uminvec);
+    j1vec = vbslq_s64(cmp, idxvec, j1vec);
+    
+    cmp = vandq_u64(vmvnq_u64(cmp), vcltq_f64(h, usubminvec));
+    usubminvec = vbslq_f64(cmp, h, usubminvec);
+    j2vec = vbslq_s64(cmp, idxvec, j2vec);
+    
+    idxvec = vaddq_s64(idxvec, vdupq_n_s64(2));
+  }
+
+  alignas(16) double uminmem[2], usubminmem[2];
+  alignas(16) int64_t j1mem[2], j2mem[2];
+  
+  vst1q_f64(uminmem, uminvec);
+  vst1q_f64(usubminmem, usubminvec);
+  vst1q_s64(j1mem, j1vec);
+  vst1q_s64(j2mem, j2vec);
+
+  idx j1 = -1, j2 = -1;
+  double umin = std::numeric_limits<double>::max(),
+         usubmin = std::numeric_limits<double>::max();
+  for (int vi = 0; vi < 2; vi++) {
+    double h = uminmem[vi];
+    if (h < usubmin) {
+      idx jnew = j1mem[vi];
+      if (h >= umin) {
+        usubmin = h;
+        j2 = jnew;
+      } else {
+        usubmin = umin;
+        umin = h;
+        j2 = j1;
+        j1 = jnew;
+      }
+    }
+  }
+  for (int vi = 0; vi < 2; vi++) {
+    double h = usubminmem[vi];
+    if (h < usubmin) {
+      usubmin = h;
+      j2 = j2mem[vi];
+    }
+  }
+  for (idx j = dim & 0xFFFFFFFEu; j < dim; j++) {
+    double h = local_cost[j] - v[j];
     if (h < usubmin) {
       if (h >= umin) {
         usubmin = h;
@@ -241,7 +354,7 @@ find_umins(
       #endif
     } else if constexpr(std::is_same_v<cost, double>) {
       #ifdef __aarch64__
-        return find_umins_regular(dim, i, assign_cost, v);
+        return find_umins_neon_double(dim, i, assign_cost, v);
       #else
         return find_umins_avx2(dim, i, assign_cost, v);
       #endif
